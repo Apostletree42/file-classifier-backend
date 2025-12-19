@@ -96,8 +96,7 @@ CLASS_LABELS = [
     "wma", "pcap", "ttf", "dwg", "sqlite"
 ]
 
-# Load model
-device = 'cpu'  # Railway uses CPU
+device = 'cpu'
 model = LFCNN1(num_classes=75)
 checkpoint = torch.load('lfcnn1_512.pth', map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
