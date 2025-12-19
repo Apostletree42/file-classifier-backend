@@ -85,7 +85,16 @@ class LFCNN1(nn.Module):
 
 
 # Class labels (you need to provide these)
-CLASS_LABELS = [f"Class_{i}" for i in range(75)]  # REPLACE with actual labels
+CLASS_LABELS = [
+    "jpg", "arw", "cr2", "dng", "gpr", "nef", "nrw", "orf", "pef", "raf",
+    "rw2", "3fr", "tiff", "heic", "bmp", "gif", "png", "ai", "eps", "psd",
+    "mov", "mp4", "3gp", "avi", "mkv", "ogv", "webm", "apk", "jar", "msi",
+    "dmg", "7z", "bz2", "deb", "gz", "pkg", "rar", "rpm", "xz", "zip",
+    "exe", "mach-o", "elf", "dll", "doc", "docx", "key", "ppt", "pptx", "xls",
+    "xlsx", "djvu", "epub", "mobi", "pdf", "md", "rtf", "txt", "tex", "json",
+    "html", "xml", "log", "csv", "aiff", "flac", "m4a", "mp3", "ogg", "wav",
+    "wma", "pcap", "ttf", "dwg", "sqlite"
+]
 
 # Load model
 device = 'cpu'  # Railway uses CPU
