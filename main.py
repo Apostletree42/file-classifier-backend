@@ -1,90 +1,101 @@
+import random
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import List, Dict
-import io
 
 app = FastAPI(title="File Fragment Classifier")
 
-# CORS for Netlify frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict this in production
+    allow_origins=["*"],  # Restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Model Architecture (copy from your notebook)
+
+# ====== Depthwise Separable Convolution ======
 class DepthwiseSeparableConv(nn.Module):
-    def __init__(self, in_ch, out_ch, k, padding):
+    def __init__(self, in_ch, out_ch, kernel_size, padding):
         super().__init__()
-        self.depth = nn.Conv1d(
-            in_ch, in_ch, k,
+        self.depthwise = nn.Conv1d(
+            in_ch, in_ch,
+            kernel_size=kernel_size,
             padding=padding,
             groups=in_ch,
             bias=False
         )
-        self.point = nn.Conv1d(in_ch, out_ch, 1, bias=False)
+        self.pointwise = nn.Conv1d(
+            in_ch, out_ch,
+            kernel_size=1,
+            bias=False
+        )
         self.bn = nn.BatchNorm1d(out_ch)
 
     def forward(self, x):
-        x = self.depth(x)
-        x = self.point(x)
+        x = self.depthwise(x)
+        x = self.pointwise(x)
         return self.bn(x)
 
 
-class InceptionBlock(nn.Module):
-    def __init__(self, ch):
+# ====== Inception Block (512 optimized) ======
+class InceptionBlock512(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.b11 = DepthwiseSeparableConv(ch, ch, 11, 5)
-        self.b19 = DepthwiseSeparableConv(ch, ch, 19, 9)
-        self.b27 = DepthwiseSeparableConv(ch, ch, 27, 13)
+        self.b7 = DepthwiseSeparableConv(channels, channels, 7, 3)
+        self.b11 = DepthwiseSeparableConv(channels, channels, 11, 5)
 
-        self.pool = nn.MaxPool1d(4)
-        self.conv1x1 = nn.Conv1d(ch, ch, 1, stride=4)
+        self.pool = nn.MaxPool1d(2, 2)
+        self.skip = nn.Conv1d(
+            channels, channels,
+            kernel_size=1,
+            stride=2,
+            bias=False
+        )
+
+        self.bn = nn.BatchNorm1d(channels)
+        self.act = nn.Hardswish()
 
     def forward(self, x):
-        a = F.relu(self.b11(x))
-        b = F.relu(self.b19(x))
-        c = F.relu(self.b27(x))
-        y = a + b + c
-        y = self.pool(y)
-        s = self.conv1x1(x)
-        return F.relu(y + s)
+        y = self.pool(
+            self.act(self.b7(x)) +
+            self.act(self.b11(x))
+        )
+        s = self.skip(x)
+        return self.act(self.bn(y + s))
 
 
-class LFCNN1(nn.Module):
+# ====== LFCNN-512 (Improved Model) ======
+class LFCNN_512(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
 
-        self.embed = nn.Embedding(256, 32)
-        self.conv = nn.Conv1d(32, 64, 3, padding=1)
+        self.embedding = nn.Embedding(256, 48)
+
+        self.conv1 = nn.Conv1d(48, 64, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
         self.act = nn.Hardswish()
 
-        self.inc1 = InceptionBlock(64)
-        self.inc2 = InceptionBlock(64)
-        self.inc3 = InceptionBlock(64)
+        self.inc1 = InceptionBlock512(64)
+        self.inc2 = InceptionBlock512(64)
 
         self.gap = nn.AdaptiveAvgPool1d(1)
+        self.drop = nn.Dropout(0.3)
         self.fc = nn.Conv1d(64, num_classes, 1)
 
     def forward(self, x):
-        x = self.embed(x)
-        x = x.permute(0, 2, 1)
-        x = self.act(self.conv(x))
+        x = self.embedding(x).permute(0, 2, 1)
+        x = self.act(self.bn1(self.conv1(x)))
         x = self.inc1(x)
         x = self.inc2(x)
-        x = self.inc3(x)
-        x = self.gap(x)
-        x = self.fc(x)
-        return x.squeeze(-1)
+        x = self.drop(self.gap(x))
+        return self.fc(x).squeeze(-1)
 
 
-# Class labels (you need to provide these)
+# Class labels (75 classes from FFT-75)
 CLASS_LABELS = [
     "jpg", "arw", "cr2", "dng", "gpr", "nef", "nrw", "orf", "pef", "raf",
     "rw2", "3fr", "tiff", "heic", "bmp", "gif", "png", "ai", "eps", "psd",
@@ -96,65 +107,83 @@ CLASS_LABELS = [
     "wma", "pcap", "ttf", "dwg", "sqlite"
 ]
 
-device = 'cpu'
-model = LFCNN1(num_classes=75)
-checkpoint = torch.load('lfcnn1_512.pth', map_location=device)
-model.load_state_dict(checkpoint['model_state_dict'])
+NUM_CLASSES = 75
+idx_to_class = {i: cls for i, cls in enumerate(CLASS_LABELS)}
+
+# Load model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = LFCNN_512(num_classes=NUM_CLASSES)
+
+# Load weights - direct state_dict (not wrapped in checkpoint dict)
+MODEL_PATH = "lfcnn1_512.pth"
+try:
+    state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    print(f"✅ Model loaded from {MODEL_PATH}")
+except FileNotFoundError:
+    print(f"⚠️ Model file {MODEL_PATH} not found. Place it in the same directory.")
+except Exception as e:
+    print(f"⚠️ Error loading model: {e}")
+
 model.eval()
 model.to(device)
 
 
 def preprocess_file(file_bytes: bytes) -> torch.Tensor:
-    """Convert file bytes to model input format"""
-    # Take first 512 bytes
-    fragment = np.frombuffer(file_bytes[:512], dtype=np.uint8)
+    if len(file_bytes) <= 512:
+        fragment = file_bytes
+    else:
+        # Random offset, avoiding first 512 bytes (header)
+        max_offset = len(file_bytes) - 512
+        offset = random.randint(min(512, max_offset), max_offset)
+        fragment = file_bytes[offset:offset+512]
     
-    # Pad if less than 512 bytes
-    if len(fragment) < 512:
-        fragment = np.pad(fragment, (0, 512 - len(fragment)), 'constant')
+    arr = np.frombuffer(fragment, dtype=np.uint8)
+    if len(arr) < 512:
+        arr = np.pad(arr, (0, 512 - len(arr)), 'constant')
     
-    # Convert to tensor
-    tensor = torch.tensor(fragment, dtype=torch.long).unsqueeze(0)
-    return tensor
+    return torch.tensor(arr, dtype=torch.long).unsqueeze(0)
 
 
 @app.get("/")
 def root():
-    return {"status": "File Fragment Classifier API", "model": "LFCNN1"}
+    return {
+        "status": "File Fragment Classifier API",
+        "model": "LFCNN-512",
+        "classes": NUM_CLASSES
+    }
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        # Read file
         contents = await file.read()
         
         if len(contents) == 0:
             raise HTTPException(status_code=400, detail="Empty file")
         
-        # Preprocess
         input_tensor = preprocess_file(contents).to(device)
         
-        # Predict
         with torch.no_grad():
-            output = model(input_tensor)
-            probabilities = F.softmax(output, dim=1)[0]
+            logits = model(input_tensor)
+            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
         
-        # Get top 3 predictions
-        top_k = 3
-        top_probs, top_indices = torch.topk(probabilities, top_k)
+        # Top 5 predictions
+        top_k = 5
+        top_indices = probs.argsort()[-top_k:][::-1]
         
         predictions = [
             {
-                "class": CLASS_LABELS[idx.item()],
-                "confidence": prob.item(),
-                "class_id": idx.item()
+                "class": idx_to_class[int(idx)],
+                "confidence": float(probs[idx]),
+                "class_id": int(idx)
             }
-            for prob, idx in zip(top_probs, top_indices)
+            for idx in top_indices
         ]
         
         return {
             "filename": file.filename,
+            "file_size": len(contents),
             "predictions": predictions
         }
         
@@ -164,4 +193,26 @@ async def predict(file: UploadFile = File(...)):
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "device": device}
+
+
+@app.get("/classes")
+def get_classes():
+    return {"classes": CLASS_LABELS, "count": NUM_CLASSES}
+
+@app.get("/debug")
+def debug():
+    # PNG magic bytes: 89 50 4E 47 0D 0A 1A 0A
+    png_bytes = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b'\x00' * 504
+    input_tensor = preprocess_file(png_bytes).to(device)
+    
+    with torch.no_grad():
+        logits = model(input_tensor)
+        probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+    
+    top_idx = probs.argsort()[-5:][::-1]
+    return {
+        "test": "PNG magic bytes",
+        "expected": "png (index 16)",
+        "predictions": [(idx_to_class[int(i)], float(probs[i])) for i in top_idx]
+    }
