@@ -1,6 +1,8 @@
 import random
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -129,7 +131,8 @@ model.eval()
 model.to(device)
 
 
-def preprocess_file(file_bytes: bytes) -> torch.Tensor:
+def extract_fragment(file_bytes: bytes) -> list:
+    """Extract a 512-byte fragment from file"""
     if len(file_bytes) <= 512:
         fragment = file_bytes
     else:
@@ -138,11 +141,26 @@ def preprocess_file(file_bytes: bytes) -> torch.Tensor:
         offset = random.randint(min(512, max_offset), max_offset)
         fragment = file_bytes[offset:offset+512]
     
-    arr = np.frombuffer(fragment, dtype=np.uint8)
+    arr = list(fragment)
+    # Pad if needed
+    if len(arr) < 512:
+        arr = arr + [0] * (512 - len(arr))
+    
+    return arr
+
+
+def bytes_to_tensor(byte_list: List[int]) -> torch.Tensor:
+    """Convert byte list to model input tensor"""
+    arr = np.array(byte_list[:512], dtype=np.uint8)
     if len(arr) < 512:
         arr = np.pad(arr, (0, 512 - len(arr)), 'constant')
-    
     return torch.tensor(arr, dtype=torch.long).unsqueeze(0)
+
+
+# Request model for byte-based prediction
+class BytePredictionRequest(BaseModel):
+    bytes: List[int]
+    filename: str
 
 
 @app.get("/")
@@ -154,6 +172,77 @@ def root():
     }
 
 
+@app.post("/extract-bytes")
+async def extract_bytes(file: UploadFile = File(...)):
+    """
+    Extract 512-byte fragment from uploaded file.
+    Returns the byte array for frontend manipulation.
+    """
+    try:
+        contents = await file.read()
+        
+        if len(contents) == 0:
+            raise HTTPException(status_code=400, detail="Empty file")
+        
+        fragment = extract_fragment(contents)
+        
+        return {
+            "filename": file.filename,
+            "original_size": len(contents),
+            "fragment_size": len(fragment),
+            "bytes": fragment
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/predict-bytes")
+async def predict_bytes(request: BytePredictionRequest):
+    """
+    Predict file type from manipulated byte array.
+    Accepts the byte array directly (after user modifications).
+    """
+    try:
+        if len(request.bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty byte array")
+        
+        # Validate bytes are in valid range
+        if any(b < 0 or b > 255 for b in request.bytes):
+            raise HTTPException(status_code=400, detail="Invalid byte values (must be 0-255)")
+        
+        input_tensor = bytes_to_tensor(request.bytes).to(device)
+        
+        with torch.no_grad():
+            logits = model(input_tensor)
+            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+        
+        # Top 5 predictions
+        top_k = 5
+        top_indices = probs.argsort()[-top_k:][::-1]
+        
+        predictions = [
+            {
+                "class": idx_to_class[int(idx)],
+                "confidence": float(probs[idx]),
+                "class_id": int(idx)
+            }
+            for idx in top_indices
+        ]
+        
+        return {
+            "filename": request.filename,
+            "fragment_size": min(len(request.bytes), 512),
+            "predictions": predictions
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Keep original predict endpoint for backward compatibility
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
@@ -162,7 +251,8 @@ async def predict(file: UploadFile = File(...)):
         if len(contents) == 0:
             raise HTTPException(status_code=400, detail="Empty file")
         
-        input_tensor = preprocess_file(contents).to(device)
+        fragment = extract_fragment(contents)
+        input_tensor = bytes_to_tensor(fragment).to(device)
         
         with torch.no_grad():
             logits = model(input_tensor)
@@ -200,11 +290,13 @@ def health():
 def get_classes():
     return {"classes": CLASS_LABELS, "count": NUM_CLASSES}
 
+
 @app.get("/debug")
 def debug():
     # PNG magic bytes: 89 50 4E 47 0D 0A 1A 0A
     png_bytes = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b'\x00' * 504
-    input_tensor = preprocess_file(png_bytes).to(device)
+    fragment = list(png_bytes)
+    input_tensor = bytes_to_tensor(fragment).to(device)
     
     with torch.no_grad():
         logits = model(input_tensor)
