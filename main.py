@@ -117,7 +117,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model = LFCNN_512(num_classes=NUM_CLASSES)
 
 # Load weights - direct state_dict (not wrapped in checkpoint dict)
-MODEL_PATH = "lfcnn1_512.pth"
+MODEL_PATH = "best_lfcnn_512.pth"
 try:
     state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
